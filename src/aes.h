@@ -86,7 +86,7 @@ typedef struct {
     unsigned int Dk[60];   /**< Decryption key schedule (inverse of Ek) */
     unsigned int Iv[4];    /**< Initialization Vector for CBC mode (4 words = 16 bytes) */
     unsigned char Nr;      /**< Number of rounds (10, 12, or 14 based on key size) */
-    unsigned char Mode;    /**< Operating mode: EBC (0) or CBC (1) */
+    unsigned char Mode;    /**< Operating mode: EBC (0) or CBC (1). Note: EBC is misspelled ECB */
 } AesCtx;
 
 /* ==========================================================================
@@ -121,7 +121,7 @@ typedef struct {
  * @{
  */
 // mode
-#define EBC 0  /**< Electronic Codebook - each block independent */
+#define EBC 0  /**< Electronic Codebook mode (note: commonly abbreviated ECB, misspelled here) */
 #define CBC 1  /**< Cipher Block Chaining - blocks linked via XOR */
 /** @} */
 
