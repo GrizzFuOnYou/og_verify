@@ -1,7 +1,105 @@
+/**
+ * @file aes.c
+ * @brief AES (Advanced Encryption Standard) Implementation
+ *
+ * This file implements the AES block cipher algorithm supporting 128, 192,
+ * and 256-bit keys with ECB and CBC modes of operation.
+ *
+ * ## What is AES?
+ * AES (originally called Rijndael) is a symmetric block cipher adopted
+ * as an encryption standard by the U.S. government. It operates on
+ * 128-bit (16-byte) blocks and supports key sizes of 128, 192, or 256 bits.
+ *
+ * ## How AES Works
+ *
+ * ### Key Expansion
+ * The original key is expanded into a "key schedule" - a series of round
+ * keys. For AES-128, this means 11 round keys (176 bytes total).
+ *
+ * ### Encryption Rounds
+ * AES processes each 16-byte block through multiple rounds:
+ * - AES-128: 10 rounds
+ * - AES-192: 12 rounds  
+ * - AES-256: 14 rounds
+ *
+ * Each round (except the last) applies four operations:
+ * 1. **SubBytes**: Non-linear substitution using an S-box
+ * 2. **ShiftRows**: Cyclic shift of rows
+ * 3. **MixColumns**: Linear mixing of columns
+ * 4. **AddRoundKey**: XOR with round key
+ *
+ * The last round omits MixColumns.
+ *
+ * ### Lookup Tables (Te0-Te4, Td0-Td4)
+ * This implementation uses precomputed lookup tables for speed:
+ * - Te0-Te4: Encryption tables (combine SubBytes + MixColumns)
+ * - Td0-Td4: Decryption tables (inverse operations)
+ *
+ * Each table is 256 entries × 4 bytes = 1KB, totaling ~10KB for all tables.
+ *
+ * ## DJI Firmware Usage
+ * DJI uses AES-128 in two stages:
+ * 1. **ECB mode**: Decrypt the 16-byte "scramble key" from the header
+ *    using the master key (PUEK or SLEK)
+ * 2. **CBC mode**: Decrypt the firmware payload using the scramble key
+ *    with IV = 0
+ *
+ * ## Security Notes
+ * - **ECB mode** should only be used for small amounts of data (like keys)
+ *   as it reveals patterns in repeated plaintext blocks
+ * - **CBC mode** is used for bulk data encryption
+ * - The IV (Initialization Vector) should ideally be random for each
+ *   encryption, but DJI uses all zeros
+ *
+ * ## API Functions
+ * - AesCtxIni(): Initialize context with key and mode
+ * - AesEncrypt(): Encrypt plaintext
+ * - AesDecrypt(): Decrypt ciphertext
+ *
+ * @see aes.h for API documentation and constants
+ * @see verify.c for how AES is used in DJI firmware decryption
+ *
+ * @note This source code is in the public domain
+ */
+
 #include "stdio.h"
 #include "aes.h"
 
+/**
+ * @brief EMBEDDED flag to exclude the test main() function
+ *
+ * When EMBEDDED is defined, the sample main() at the end of this file
+ * is excluded. This allows the code to be used as a library in other
+ * programs like og_verify.
+ */
 #define EMBEDDED
+
+/* ==========================================================================
+ * AES LOOKUP TABLES
+ * ==========================================================================
+ * These precomputed tables combine multiple AES operations for efficiency.
+ * 
+ * ### Encryption Tables (Te0-Te4)
+ * Te0-Te3 combine SubBytes and MixColumns into single table lookups.
+ * Te4 is a simple S-box (SubBytes only) for the final round.
+ *
+ * ### Decryption Tables (Td0-Td4)
+ * Td0-Td3 combine InvSubBytes and InvMixColumns.
+ * Td4 is the inverse S-box for the final round.
+ *
+ * ### How They're Used
+ * Instead of computing: MixColumns(ShiftRows(SubBytes(state)))
+ * We can do: Te0[s0] ^ Te1[s1] ^ Te2[s2] ^ Te3[s3] ^ round_key
+ * 
+ * This is much faster than computing each operation separately.
+ *
+ * ### Table Values
+ * Each Te table entry is: S-box(x) * {02,01,01,03} for different rotations
+ * - Te0: result at positions 0,1,2,3
+ * - Te1: result at positions 3,0,1,2
+ * - Te2: result at positions 2,3,0,1
+ * - Te3: result at positions 1,2,3,0
+ * ========================================================================== */
 
 static const unsigned int Te0[256] = {
     0xc66363a5UL, 0xf87c7c84UL, 0xee777799UL, 0xf67b7b8dUL,

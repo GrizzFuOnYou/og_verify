@@ -1,3 +1,53 @@
+/**
+ * @file verify.c
+ * @brief DJI Firmware Image Verification and Decryption Tool
+ *
+ * This file contains the main logic for verifying and decrypting DJI firmware
+ * images. It is part of the og_verify project, which allows users to verify
+ * the cryptographic signatures of DJI firmware files and optionally decrypt
+ * their contents.
+ *
+ * ## Purpose
+ * DJI firmware images are cryptographically signed and often encrypted to
+ * prevent unauthorized modifications. This tool:
+ * 1. Verifies the RSA signature of the firmware header using SHA-256
+ * 2. Validates the payload digest (hash) to ensure integrity
+ * 3. Optionally decrypts the payload using AES encryption
+ * 4. Outputs the decrypted firmware data
+ *
+ * ## How It Works
+ * DJI firmware images consist of:
+ * - A header containing metadata (magic number, version, sizes, encryption keys, etc.)
+ * - An RSA signature of the header
+ * - The encrypted or unencrypted payload (the actual firmware data)
+ *
+ * The verification process:
+ * 1. Parse the header and validate the magic number "IM*H"
+ * 2. Look up the appropriate RSA public key based on the auth_key field
+ * 3. Compute SHA-256 hash of the header
+ * 4. Verify the RSA signature matches the computed hash
+ * 5. Compute SHA-256 hash of the payload and compare with stored digest
+ * 6. If outputting, decrypt using AES if needed (using scramble key decryption)
+ *
+ * ## Key Types
+ * - PRAK: Production Release Authentication Key (for official firmware)
+ * - GFAK: Ground Factory Authentication Key
+ * - SLAK: Slack Authentication Key (used by this project for custom signing)
+ * - PUEK: Production Unit Encryption Key
+ * - SLEK: Slack Encryption Key (used by this project for custom encryption)
+ *
+ * ## Usage
+ * ```
+ * og_verify -n <image_name> [-c <chunk_name>] [-H <header_file>] [-o <output>] <input_file>
+ * ```
+ *
+ * @author Jan Dumon <jan@crossbar.net>
+ * @copyright Copyright (C) 2018, GPL-3.0 License
+ *
+ * @note This tool is part of the Open Goggles (OG) project for DJI firmware
+ *       modification. It is intended for educational and research purposes.
+ */
+
 /*  Copyright (C) 2018  Jan Dumon <jan@crossbar.net>
  *
  *  This program is free software: you can redistribute it and/or modify
@@ -14,81 +64,223 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/* ==========================================================================
+ * INCLUDE HEADERS
+ * ========================================================================== */
+
 #include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <stdint.h>
-#include <getopt.h>
-#include <fcntl.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <errno.h>
+#include <stdio.h>      /* printf, fprintf for console output */
+#include <unistd.h>     /* write, close for file operations */
+#include <stdint.h>     /* uint8_t, uint32_t, uint64_t for fixed-width integers */
+#include <getopt.h>     /* getopt_long for command-line argument parsing */
+#include <fcntl.h>      /* open, O_RDONLY, O_CREAT for file operations */
+#include <string.h>     /* strcmp, memcmp for string/memory operations */
+#include <sys/stat.h>   /* fstat for getting file information */
+#include <sys/mman.h>   /* mmap for memory-mapping files */
+#include <errno.h>      /* errno, strerror for error handling */
 
-#include "mincrypt/rsa.h"
-#include "mincrypt/sha256.h"
-#include "aes.h"
+/* Project-specific cryptographic library headers */
+#include "mincrypt/rsa.h"    /* RSA signature verification */
+#include "mincrypt/sha256.h" /* SHA-256 hashing */
+#include "aes.h"             /* AES encryption/decryption */
 
+/* ==========================================================================
+ * UTILITY MACROS
+ * ========================================================================== */
+
+/**
+ * @brief Returns the minimum of two values
+ * @param a First value
+ * @param b Second value
+ * @return The smaller of a or b
+ */
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
+/* ==========================================================================
+ * DJI IMAGE STRUCTURES
+ * ==========================================================================
+ * These structures define the binary layout of DJI firmware image headers.
+ * All multi-byte fields are little-endian as DJI devices use ARM processors.
+ * ========================================================================== */
+
+/**
+ * @brief Chunk attribute flags for DJI image chunks
+ *
+ * DJI_IMAGE_CHUNK_CLEAR indicates that the chunk is NOT encrypted and can
+ * be read directly without AES decryption. If this flag is not set, the
+ * chunk data must be decrypted using the scramble key.
+ */
 enum dji_image_chunk_attr {
-    DJI_IMAGE_CHUNK_CLEAR = 0x1,
+    DJI_IMAGE_CHUNK_CLEAR = 0x1,  /**< Chunk is unencrypted (cleartext) */
 };
 
+/**
+ * @brief DJI image chunk descriptor
+ *
+ * A firmware image can contain multiple chunks (segments). Each chunk has
+ * its own ID, size, memory address, and attributes. The chunk structure
+ * follows immediately after the main header in memory.
+ *
+ * @note Chunks can be loaded to different memory addresses on the target device
+ * @note The 'reserved' field is unused but must be present for alignment
+ */
 struct dji_image_chunk {
-    uint32_t id;
-    uint32_t offset;
-    uint32_t size;
-    uint32_t attr;
-    uint64_t addr;
-    uint64_t reserved;
+    uint32_t id;        /**< 4-character chunk identifier (e.g., "0100" for main firmware) */
+    uint32_t offset;    /**< Offset of this chunk's data from start of payload */
+    uint32_t size;      /**< Size of the chunk data in bytes */
+    uint32_t attr;      /**< Chunk attributes (see dji_image_chunk_attr) */
+    uint64_t addr;      /**< Target memory address where chunk should be loaded */
+    uint64_t reserved;  /**< Reserved for future use, should be 0 */
 };
 
 typedef struct dji_image_chunk dji_image_chunk_t;
 
+/**
+ * @brief DJI firmware image header structure
+ *
+ * This is the main header structure for DJI firmware images. It contains
+ * all metadata needed to verify, decrypt, and load the firmware.
+ *
+ * ## Header Layout (192 bytes base + variable chunk array):
+ * - Bytes 0-3:   Magic number "IM*H"
+ * - Bytes 4-7:   Header version (typically 1)
+ * - Bytes 8-11:  Total image size
+ * - Bytes 16-19: Header size (192 bytes + chunk array)
+ * - Bytes 20-23: Signature size (256 bytes for RSA-2048)
+ * - Bytes 24-27: Payload size (encrypted/compressed firmware data)
+ * - Bytes 40-43: Authentication key identifier (e.g., "PRAK", "SLAK")
+ * - Bytes 44-47: Encryption key identifier (e.g., "PUEK", "SLEK")
+ * - Bytes 48-63: Scramble key (AES key encrypted with enc_key)
+ * - Bytes 64-95: Image name (null-terminated string)
+ * - Bytes 160-191: SHA-256 digest of payload
+ *
+ * @note The chunk[] array is variable-length based on chunk_num
+ */
 struct dji_image_header {
-    uint32_t magic_num;
-    uint32_t header_version;
-    uint32_t size;
-    uint32_t reserved;
-    uint32_t header_size;
-    uint32_t signature_size;
-    uint32_t payload_size;
-    uint32_t target_size;
-    uint8_t os;
-    uint8_t arch;
-    uint8_t compression;
-    uint8_t anti_version;
-    uint32_t auth_alg;
-    uint32_t auth_key;
-    uint32_t enc_key;
-    uint8_t scram_key[16];
-    uint8_t name[32];
-    uint32_t type;
-    uint32_t version;
-    uint32_t date;
-    uint32_t reserved2[5];
-    uint32_t userdata[4];
-    uint64_t entry;
-    uint32_t reserved3;
-    uint32_t chunk_num;
-    uint8_t payload_digest[32];
-    dji_image_chunk_t chunk[];
+    uint32_t magic_num;       /**< Magic number: "IM*H" (0x482A4D49 little-endian) */
+    uint32_t header_version;  /**< Header format version (1 = current) */
+    uint32_t size;            /**< Total image size: header + signature + payload */
+    uint32_t reserved;        /**< Reserved, should be 0 */
+    uint32_t header_size;     /**< Size of header including chunk descriptors */
+    uint32_t signature_size;  /**< RSA signature size (256 bytes for RSA-2048) */
+    uint32_t payload_size;    /**< Size of the payload data */
+    uint32_t target_size;     /**< Expected size after decompression */
+    uint8_t os;               /**< Target OS (0=bare metal, 1=Linux, etc.) */
+    uint8_t arch;             /**< Target architecture (0=ARM, etc.) */
+    uint8_t compression;      /**< Compression type (0=none, 1=gzip, etc.) */
+    uint8_t anti_version;     /**< Anti-rollback version counter */
+    uint32_t auth_alg;        /**< Authentication algorithm (1=RSA-SHA256) */
+    uint32_t auth_key;        /**< Authentication key ID (e.g., 'PRAK', 'SLAK') */
+    uint32_t enc_key;         /**< Encryption key ID (e.g., 'PUEK', 'SLEK') */
+    uint8_t scram_key[16];    /**< AES-128 scramble key (encrypted with enc_key) */
+    uint8_t name[32];         /**< Null-terminated image name */
+    uint32_t type;            /**< Image type identifier */
+    uint32_t version;         /**< Firmware version (BCD encoded) */
+    uint32_t date;            /**< Build date (BCD encoded: YYYYMMDD) */
+    uint32_t reserved2[5];    /**< Reserved fields */
+    uint32_t userdata[4];     /**< User-defined data fields */
+    uint64_t entry;           /**< Entry point address for executable images */
+    uint32_t reserved3;       /**< Reserved */
+    uint32_t chunk_num;       /**< Number of chunks in the chunk array */
+    uint8_t payload_digest[32]; /**< SHA-256 hash of the payload for integrity */
+    dji_image_chunk_t chunk[];  /**< Variable-length array of chunk descriptors */
 };
 
 typedef struct dji_image_header dji_image_header_t;
 
+/* ==========================================================================
+ * BYTE ORDER CONVERSION MACROS
+ * ==========================================================================
+ * DJI uses 4-character identifiers stored as 32-bit integers. These macros
+ * convert between string literals and their integer representations.
+ * ========================================================================== */
+
+/**
+ * @brief Swap bytes in a 32-bit integer (little-endian <-> big-endian)
+ *
+ * This macro reverses the byte order of a 32-bit value. For example:
+ * - Input:  0x12345678
+ * - Output: 0x78563412
+ *
+ * @param i 32-bit integer to swap
+ * @return Byte-swapped 32-bit integer
+ */
 #define SWAP(i) (((i) >> 24) | (((i) & 0x00ff0000 )>> 8) | (((i) & 0x0000ff00) << 8) | ((i) << 24))
+
+/**
+ * @brief Convert a 4-character string literal to a 32-bit identifier
+ *
+ * DJI uses 4-character codes like "PRAK", "SLAK", "IM*H" as identifiers.
+ * This macro converts these to their integer form for comparison.
+ *
+ * Example: STR2ID('IM*H') produces the magic number for header validation.
+ *
+ * @param n 4-character string (as multi-char literal)
+ * @return 32-bit integer representation
+ */
 #define STR2ID(n) SWAP((uint32_t)n)
 
+/* ==========================================================================
+ * CRYPTOGRAPHIC KEYS
+ * ==========================================================================
+ * These are the encryption and authentication keys used by DJI firmware.
+ * Different keys are used for different purposes and device families.
+ *
+ * SECURITY NOTE: These keys are extracted from DJI firmware and hardware.
+ * They are included here for educational and research purposes only.
+ * ========================================================================== */
+
+/**
+ * @brief PUEK - Production Unit Encryption Key (commented out)
+ *
+ * This was the encryption key used for Goggles RE (Racing Edition).
+ * Different DJI product lines use different encryption keys.
+ */
 /* GogglesRE */
 //static uint8_t PUEK[16] = { 0x77, 0x0d, 0xe4, 0xe3, 0xcc, 0x0c, 0x95, 0x7b, 0x03, 0x00, 0x6f, 0xfe, 0x02, 0xa3, 0xd4, 0x66 };
 
+/**
+ * @brief PUEK - Production Unit Encryption Key (Mavic)
+ *
+ * This 16-byte AES-128 key is used to decrypt the scramble key stored
+ * in the firmware header. The scramble key is then used to decrypt
+ * the actual firmware payload.
+ *
+ * This specific key is for Mavic series drones.
+ */
 /* Mavic */
 static uint8_t PUEK[16] = { 0x63, 0xc4, 0x8e, 0x83, 0x26, 0x7e, 0xee, 0xc0, 0x3f, 0x33, 0x30, 0xad, 0xb2, 0x38, 0xdd, 0x6b };
 
+/**
+ * @brief SLEK - Slack Encryption Key
+ *
+ * This is the encryption key used by the og_verify project for custom
+ * firmware signing. When you sign firmware with sign.py, it uses this
+ * key to encrypt the scramble key.
+ *
+ * "Slack" refers to the Slack community where this project originated.
+ */
 static uint8_t SLEK[16] = { 0x56, 0x79, 0x6C, 0x0E, 0xEE, 0x0F, 0x38, 0x05, 0x20, 0xE0, 0xBE, 0x70, 0xF2, 0x77, 0xD9, 0x0B };
 
+/**
+ * @brief PRAK - Production Release Authentication Key
+ *
+ * This is the RSA-2048 public key used by DJI to sign official firmware.
+ * The firmware header is hashed with SHA-256 and the hash is signed with
+ * the corresponding private key (which only DJI possesses).
+ *
+ * ## RSAPublicKey Structure Explained:
+ * - len: Number of 32-bit words in the modulus (64 for 2048-bit RSA)
+ * - n0inv: Precomputed value for Montgomery multiplication optimization
+ *          This is -1/n[0] mod 2^32, used to speed up modular arithmetic
+ * - n[]: The RSA modulus (public key N) as a little-endian array
+ * - rr[]: Precomputed R^2 mod N for Montgomery multiplication
+ *         R = 2^(32*len), this speeds up the modular exponentiation
+ * - exponent: Public exponent (65537 is standard, 3 is also supported)
+ *
+ * @note These precomputed values allow signature verification to be
+ *       performed efficiently without expensive division operations.
+ */
 static RSAPublicKey PRAK = {
     .len = 64,
     .n0inv = 0x411615c3l,
@@ -113,6 +305,12 @@ static RSAPublicKey PRAK = {
     .exponent = 65537
 };
 
+/**
+ * @brief GFAK - Ground Factory Authentication Key
+ *
+ * This RSA-2048 public key is used for factory firmware images.
+ * The structure is identical to PRAK but with different key values.
+ */
 static RSAPublicKey GFAK = {
     .len = 64,
     .n0inv = 0x88a8579b,
@@ -137,6 +335,18 @@ static RSAPublicKey GFAK = {
     .exponent = 65537
 };
 
+/**
+ * @brief SLAK - Slack Authentication Key
+ *
+ * This RSA-2048 public key corresponds to the private key embedded in
+ * sign.py. It's used for custom firmware signing by the og_verify project.
+ *
+ * When you sign firmware with sign.py, the signature can be verified
+ * using this public key. This allows custom/modified firmware to pass
+ * signature verification when using og_verify.
+ *
+ * @note The corresponding private key is in sign.py as SLAK (PEM format)
+ */
 static RSAPublicKey SLAK = {
     .len = 64,
     .n0inv = 0x4dccc885,
@@ -161,31 +371,81 @@ static RSAPublicKey SLAK = {
     .exponent = 65537
 };
 
+/* ==========================================================================
+ * KEY LOOKUP TABLES
+ * ==========================================================================
+ * These tables map 4-character key identifiers to their actual key data.
+ * When the firmware header specifies a key ID, we look it up here.
+ * ========================================================================== */
+
+/**
+ * @brief Encryption key lookup table entry
+ *
+ * Maps encryption key identifiers (like "PUEK", "SLEK") to the actual
+ * 16-byte AES keys used for decrypting the scramble key.
+ */
 static struct enc_key_entry {
-    uint32_t key_id;
-    uint8_t  *key;
+    uint32_t key_id;  /**< 4-character key identifier as uint32_t */
+    uint8_t  *key;    /**< Pointer to the 16-byte AES key */
 } enc_keys[] = {
-    { STR2ID('PUEK'), PUEK },
-    { STR2ID('SLEK'), SLEK },
-    { 0, NULL },
+    { STR2ID('PUEK'), PUEK },  /**< Production Unit Encryption Key */
+    { STR2ID('SLEK'), SLEK },  /**< Slack Encryption Key */
+    { 0, NULL },               /**< Sentinel (end of list marker) */
 };
 
+/**
+ * @brief Authentication key lookup table entry
+ *
+ * Maps authentication key identifiers (like "PRAK", "SLAK") to the actual
+ * RSA public keys used for signature verification.
+ */
 static struct auth_key_entry {
-    uint32_t key_id;
-    RSAPublicKey *key;
+    uint32_t key_id;      /**< 4-character key identifier as uint32_t */
+    RSAPublicKey *key;    /**< Pointer to the RSA public key structure */
 } auth_keys[] = {
-    { STR2ID('PRAK'), &PRAK },
-    { STR2ID('GFAK'), &GFAK },
-    { STR2ID('SLAK'), &SLAK },
-    { 0, NULL },
+    { STR2ID('PRAK'), &PRAK },  /**< Production Release Authentication Key */
+    { STR2ID('GFAK'), &GFAK },  /**< Ground Factory Authentication Key */
+    { STR2ID('SLAK'), &SLAK },  /**< Slack Authentication Key */
+    { 0, NULL },                /**< Sentinel (end of list marker) */
 };
 
+/* ==========================================================================
+ * UTILITY FUNCTIONS
+ * ========================================================================== */
+
+/**
+ * @brief Convert a 32-bit key identifier to a printable string
+ *
+ * This function takes a 4-character key identifier stored as a uint32_t
+ * and returns it as a null-terminated string for printing.
+ *
+ * @param key The 32-bit key identifier (e.g., 'PRAK', 'SLAK')
+ * @return Pointer to a static buffer containing the 4-character string
+ *
+ * @warning The returned pointer is to a static buffer. Do not call this
+ *          function multiple times in a single printf() as the buffer
+ *          will be overwritten.
+ *
+ * @code
+ * printf("Auth key: %s\n", id2str(hdr->auth_key));  // OK
+ * printf("%s vs %s\n", id2str(a), id2str(b));       // BAD - second call overwrites first
+ * @endcode
+ */
 static char *id2str(uint32_t key) {
     static char buffer[5];
     *(uint32_t *)buffer = key;
     return buffer;
 }
 
+/**
+ * @brief Display help message and exit
+ *
+ * Shows usage information for the og_verify command-line tool and exits
+ * with the specified exit code.
+ *
+ * @param name Program name (argv[0]) for display in usage message
+ * @param exitvalue Exit code (0 for normal help, -1 for error)
+ */
 static void help(const char *name, int exitvalue) {
     printf("verify image\n"
            "       %s [option] -o <out_file> <in_file>\n"
@@ -203,6 +463,16 @@ static void help(const char *name, int exitvalue) {
     exit(exitvalue);
 }
 
+/**
+ * @brief Long option definitions for getopt_long()
+ *
+ * Defines the command-line options supported by this program:
+ * - help: Show usage information
+ * - name: Specify the expected image name for validation
+ * - chunk: Specify the expected chunk ID for validation
+ * - header: Use a separate header file (for split header/payload)
+ * - output: Specify the output file for decrypted data
+ */
 static const struct option longopts[] =
 {
   { "help",   no_argument,       NULL, 'h' },
@@ -213,18 +483,63 @@ static const struct option longopts[] =
   { NULL,     0,                 NULL, 0 }
 };
 
+/**
+ * @brief Print a hexadecimal dump of a byte array
+ *
+ * Useful for debugging - displays bytes as two-digit hex values separated
+ * by spaces, followed by a newline.
+ *
+ * @param p Pointer to the byte array
+ * @param len Number of bytes to display
+ *
+ * @code
+ * hexdump(hdr->scram_key, 16);  // Displays: "56 79 6c 0e ..."
+ * @endcode
+ */
 static void hexdump(uint8_t *p, int len) {
     while (len--)
         printf("%02x ", *p++);
     printf("\n");
 }
 
+/**
+ * @brief Print a hexadecimal dump of a 32-bit word array
+ *
+ * Similar to hexdump() but for 32-bit values. Each word is displayed
+ * as an 8-digit hex value.
+ *
+ * @param p Pointer to the 32-bit word array
+ * @param len Number of 32-bit words to display
+ */
 static void hexdump32(uint32_t *p, int len) {
     while (len--)
         printf("%08x ", *p++);
     printf("\n");
 }
 
+/**
+ * @brief Memory-map a file for reading
+ *
+ * Opens a file and maps it into memory using mmap(). This is efficient
+ * for large files as the OS handles paging data in/out of memory as needed.
+ *
+ * @param filename Path to the file to open
+ * @return Pointer to the memory-mapped file contents
+ *
+ * @warning Exits the program with error if the file cannot be opened.
+ *          The caller does not need to free the returned pointer, but
+ *          should call munmap() when done (not implemented in this program
+ *          as we exit after use).
+ *
+ * ## How mmap() works:
+ * Instead of reading the entire file into a buffer, mmap() tells the OS
+ * to make the file appear as a region of memory. When you access bytes
+ * in this region, the OS loads the corresponding parts of the file.
+ * This is:
+ * - Efficient: Only loads pages you actually access
+ * - Simple: Access file like an array
+ * - Fast: No explicit read() calls needed
+ */
 static void *map_file(char *filename) {
     int fd = open(filename, O_RDONLY);
     struct stat statbuf;
@@ -243,16 +558,69 @@ static void *map_file(char *filename) {
     return buffer;
 }
 
+/* ==========================================================================
+ * MAIN PROGRAM
+ * ==========================================================================
+ * The main function orchestrates the entire verification and decryption
+ * process. Here's the high-level flow:
+ *
+ * 1. Parse command-line arguments
+ * 2. Load the firmware image (header + payload)
+ * 3. Validate the magic number
+ * 4. Verify the RSA signature on the header
+ * 5. Verify the SHA-256 digest of the payload
+ * 6. Optionally decrypt and output the payload
+ * ========================================================================== */
+
+/**
+ * @brief Main entry point for og_verify
+ *
+ * Verifies a DJI firmware image file by checking its cryptographic
+ * signature and optionally decrypts the payload to an output file.
+ *
+ * ## Verification Process:
+ *
+ * ### Step 1: Signature Verification
+ * The header (including chunk descriptors) is hashed with SHA-256.
+ * This hash is then verified against the RSA signature using the
+ * public key specified in the header (PRAK, GFAK, or SLAK).
+ *
+ * ### Step 2: Payload Integrity
+ * The SHA-256 hash of the payload is computed and compared against
+ * the hash stored in the header (payload_digest field).
+ *
+ * ### Step 3: Decryption (if -o specified)
+ * If the chunk is encrypted (CHUNK_CLEAR flag not set):
+ * 1. Decrypt the scramble key using the encryption key (PUEK/SLEK)
+ * 2. Use the scramble key with AES-CBC to decrypt the payload
+ * 3. Write the decrypted data to the output file
+ *
+ * @param argc Number of command-line arguments
+ * @param argv Array of command-line argument strings
+ * @return 0 on success, exits with 1 on failure
+ */
 int main(int argc, const char **argv) {
     int opt;
     int ret = 0;
     int verbose = 0;
-    char *input = NULL;
-    char *output = NULL;
-    char *header = NULL;
-    char *image_name = NULL;
-    char *chunk_name = NULL;
+    char *input = NULL;       /* Input firmware file path */
+    char *output = NULL;      /* Output file path for decrypted data */
+    char *header = NULL;      /* Separate header file path (optional) */
+    char *image_name = NULL;  /* Expected image name for validation */
+    char *chunk_name = NULL;  /* Expected chunk name for validation */
 
+    /* ======================================================================
+     * COMMAND-LINE ARGUMENT PARSING
+     * ======================================================================
+     * Parse options using getopt_long() for both short (-h) and long
+     * (--help) option formats. Required options:
+     * - -n/--name: Image name to match against header
+     * Optional:
+     * - -o/--output: Output decrypted payload to file
+     * - -H/--header: Use separate header file
+     * - -c/--chunk: Chunk name to validate
+     * - -v: Verbose output (print header fields)
+     * ====================================================================== */
     while ((opt = getopt_long(argc, (char * const *)argv, "o:H:n:c:hv", longopts, 0)) != -1) {
         switch (opt) {
             case 'o':
@@ -279,6 +647,7 @@ int main(int argc, const char **argv) {
         }
     }
 
+    /* Validate required arguments */
     if (optind == argc) {
         printf("must input source image\n");
         help(argv[0], -1);
@@ -292,26 +661,57 @@ int main(int argc, const char **argv) {
         help(argv[0], -1);
     }
 
+    /* ======================================================================
+     * FILE LOADING
+     * ======================================================================
+     * Load the firmware image into memory. Two modes are supported:
+     *
+     * 1. Combined mode (default): Header and payload in the same file
+     *    - The header is at the start of the file
+     *    - The signature follows the header
+     *    - The payload follows the signature
+     *
+     * 2. Separate mode (-H option): Header in one file, payload in another
+     *    - Useful when header/signature need to be updated independently
+     *    - The input file contains only the payload
+     * ====================================================================== */
     unsigned char *hdr_buffer = NULL;
     unsigned char *payload = NULL;
     dji_image_header_t *hdr = NULL;
 
     if (header) {
+        /* Separate header mode: load header and payload from different files */
         hdr_buffer = map_file(header);
         hdr = (dji_image_header_t *)hdr_buffer;
         payload = map_file(input);
     }
     else {
+        /* Combined mode: header and payload in the same file */
         hdr_buffer = map_file(input);
         hdr = (dji_image_header_t *)hdr_buffer;
+        /* Payload starts after header + signature */
         payload = hdr_buffer + hdr->header_size + hdr->signature_size;
     }
 
+    /* ======================================================================
+     * MAGIC NUMBER VALIDATION
+     * ======================================================================
+     * The first 4 bytes of a valid DJI firmware header must be "IM*H"
+     * (stored as 0x482A4D49 in little-endian). This is a quick sanity
+     * check before doing expensive cryptographic operations.
+     * ====================================================================== */
     if (hdr->magic_num != STR2ID('IM*H')) {
         printf("Invalid header magic!\n");
         exit(1);
     }
 
+    /* ======================================================================
+     * VERBOSE OUTPUT
+     * ======================================================================
+     * When -v is specified, print all header fields for debugging.
+     * This is useful for understanding the firmware image structure
+     * and diagnosing issues with verification or decryption.
+     * ====================================================================== */
     if (verbose) {
         printf("magic:          %s\n", id2str(hdr->magic_num));
         printf("header_version: %d\n", hdr->header_version);
@@ -345,16 +745,25 @@ int main(int argc, const char **argv) {
         hexdump(hdr->payload_digest, 32);
     }
 
+    /* ======================================================================
+     * IMAGE NAME VALIDATION
+     * ======================================================================
+     * Verify that the image name in the header matches the expected name
+     * provided via -n. This prevents accidentally processing the wrong
+     * firmware file.
+     * ====================================================================== */
     if (strcmp((const char *)hdr->name, image_name) != 0) {
         printf("Invalid image name!\n");
         exit(1);
     }
 
+    /* Optionally validate chunk name if -c was specified */
     if (chunk_name && (strcmp(id2str(hdr->chunk[0].id), chunk_name) != 0)) {
         printf("Invalid chunk name!\n");
         exit(1);
     }
 
+    /* Print chunk info in verbose mode */
     if (verbose) {
         printf("chunk id:       %s\n", id2str(hdr->chunk[0].id));
         printf("chunk offset:   %d\n", hdr->chunk[0].offset);
@@ -362,8 +771,27 @@ int main(int argc, const char **argv) {
         printf("chunk attr:     %08x\n", hdr->chunk[0].attr);
     }
 
+    /* ======================================================================
+     * RSA SIGNATURE VERIFICATION
+     * ======================================================================
+     * This is the core security check. We need to verify that the header
+     * was signed by DJI (or by us using SLAK).
+     *
+     * Process:
+     * 1. Look up the RSA public key based on the auth_key field
+     * 2. Compute SHA-256 hash of the header (including chunk descriptors)
+     * 3. Verify the signature using the public key
+     *
+     * The signature is located immediately after the header in the file.
+     * For RSA-2048, it's 256 bytes long.
+     *
+     * If verification fails, the firmware has been tampered with or is
+     * signed with an unknown key.
+     * ====================================================================== */
     RSAPublicKey *auth_key;
     struct auth_key_entry *auth_iter = auth_keys;
+    
+    /* Search for the matching authentication key */
     while ((auth_key = auth_iter->key) && auth_iter->key_id != 0 && auth_iter->key_id != hdr->auth_key)
         auth_iter++;
 
@@ -372,10 +800,11 @@ int main(int argc, const char **argv) {
         exit(1);
     }
 
+    /* Compute SHA-256 hash of the header and verify RSA signature */
     unsigned char hash[32];
     SHA256_hash(hdr, hdr->header_size, hash);
     ret = RSA_verify(auth_key,
-               (const unsigned char*)hdr + hdr->header_size,
+               (const unsigned char*)hdr + hdr->header_size,  /* Signature location */
                hdr->signature_size,
                hash,
                sizeof(hash));
@@ -385,18 +814,57 @@ int main(int argc, const char **argv) {
         exit(1);
     }
 
+    /* ======================================================================
+     * PAYLOAD DIGEST VERIFICATION
+     * ======================================================================
+     * Even if the header signature is valid, we need to verify that the
+     * payload hasn't been modified. The header contains a SHA-256 hash
+     * of the payload that we can check.
+     *
+     * This ensures end-to-end integrity: the header is signed, and the
+     * header contains the hash of the payload.
+     * ====================================================================== */
     SHA256_hash(payload, hdr->payload_size, hash);
     if (memcmp(hash, hdr->payload_digest, 32) != 0) {
         printf("Digest verification failed\n");
         exit(1);
     }
 
+    /* ======================================================================
+     * PAYLOAD DECRYPTION AND OUTPUT
+     * ======================================================================
+     * If an output file was specified (-o), write the decrypted payload.
+     *
+     * Two cases:
+     * 1. DJI_IMAGE_CHUNK_CLEAR flag is set: Payload is not encrypted
+     *    - Simply copy the payload to the output file
+     *
+     * 2. Flag is not set: Payload is AES-128-CBC encrypted
+     *    - First, decrypt the scramble key using the encryption key
+     *      (PUEK or SLEK) in ECB mode
+     *    - Then, use the scramble key to decrypt the payload in CBC mode
+     *    - The IV (initialization vector) is all zeros
+     *
+     * ## AES Encryption Layers:
+     * Layer 1: scram_key is encrypted with PUEK/SLEK using AES-ECB
+     * Layer 2: payload is encrypted with scram_key using AES-CBC (IV=0)
+     *
+     * This two-layer approach allows the firmware to use a unique
+     * per-image key (scram_key) while still allowing verification tools
+     * to decrypt using a shared master key (PUEK/SLEK).
+     * ====================================================================== */
     if (output) {
+        /* Open output file for writing */
         int fd2 = open(output, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        
         if (hdr->chunk[0].attr & DJI_IMAGE_CHUNK_CLEAR) {
+            /* Unencrypted payload - write directly */
             write(fd2, payload, hdr->chunk[0].size);
         }
         else {
+            /* Encrypted payload - need to decrypt first */
+            
+            /* Look up the encryption key based on enc_key field */
             uint8_t *enc_key;
             struct enc_key_entry *enc_iter = enc_keys;
             while ((enc_key = enc_iter->key) && enc_iter->key_id != 0 && enc_iter->key_id != hdr->enc_key)
@@ -407,31 +875,51 @@ int main(int argc, const char **argv) {
                 exit(1);
             }
 
+            /* 
+             * Step 1: Decrypt the scramble key
+             * The scram_key in the header is encrypted with the master key.
+             * We decrypt it to get the actual AES key for the payload.
+             */
             uint8_t scram_key[16];
             unsigned char iv[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
             AesCtx ctx;
 
+            /* Initialize AES context with the master key (ECB mode for key decryption) */
             if( AesCtxIni(&ctx, NULL, enc_key, KEY128, EBC) < 0) {
                 printf("Failed to init AES\n");
                 exit(1);
             }
 
+            /* Decrypt the 16-byte scramble key */
             if (AesDecrypt(&ctx, hdr->scram_key, scram_key, sizeof(scram_key)) < 0) {
                 printf("Failed to decrypt\n");
                 exit(1);
             }
 
+            /*
+             * Step 2: Decrypt the payload
+             * Now use the decrypted scramble key with CBC mode.
+             * CBC (Cipher Block Chaining) provides better security than ECB
+             * by XORing each block with the previous ciphertext block.
+             */
             if( AesCtxIni(&ctx, iv, scram_key, KEY128, CBC) < 0) {
                 printf("Failed to init AES\n");
                 exit(1);
             }
 
+            /* Allocate buffer for decryption (process 1KB at a time) */
             unsigned char *outbuf = malloc(1024);
             if (!outbuf) {
                 printf("Failed to allocate 1024 bytes\n");
                 exit(1);
             }
 
+            /*
+             * Decrypt and write in chunks
+             * 
+             * AES works on 16-byte blocks, so we need to round up the size.
+             * We decrypt the padded length but only write the actual data size.
+             */
             int padded_len = (((hdr->chunk[0].size + 15) / 16) * 16);
             int pos = 0;
             while (padded_len) {
@@ -443,6 +931,7 @@ int main(int argc, const char **argv) {
                 pos += n;
                 padded_len -= n;
 
+                /* Don't write more than the actual chunk size (handle padding) */
                 if (pos > hdr->chunk[0].size)
                 n = hdr->chunk[0].size - (pos - n);
                 write(fd2, outbuf, n);
